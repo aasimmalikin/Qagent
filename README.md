@@ -1,248 +1,208 @@
-# Vendor Security Questionnaire Agent
+# qagent — a vendor security questionnaire agent, in pure Python
 
-A runnable, production-shaped agentic system that auto-drafts answers to vendor
-security questionnaires — and, more to the point, a worked example of **every
-asyncio concept on the "production floor" syllabus**, each used where it
-naturally belongs rather than bolted on.
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![Dependencies](https://img.shields.io/badge/dependencies-httpx%20%2B%20pydantic-brightgreen)
+![Agent frameworks](https://img.shields.io/badge/agent%20frameworks-none-critical)
+![Runs offline](https://img.shields.io/badge/runs%20offline-no%20API%20key-informational)
 
-```
-python -m qagent.main      # runs end-to-end with a simulated LLM, no API key needed
-```
+A multi-agent pipeline that auto-drafts answers to vendor **security questionnaires** — and,
+just as importantly, a worked, runnable example of the concurrency machinery that agent
+frameworks hide from you.
 
----
-
-## 1. What it does & the business problem
-
-**The problem.** Every B2B software company that sells to mid-market and
-enterprise gets hit with security/vendor-risk questionnaires — SIG, CAIQ, or a
-prospect's bespoke spreadsheet — with anywhere from 50 to 400 questions like
-*"Do you encrypt data at rest?"*, *"What is your RTO/RPO?"*, *"Do you hold a SOC
-2 report?"*. Today a security or sales engineer answers these by hand, copy-
-pasting from past responses and policy docs. It takes days per questionnaire and
-is a direct bottleneck on closing deals. It's repetitive, grounded in a stable
-body of internal knowledge, and every question is independent — an almost
-perfect fit for an agent.
-
-**What this agent does.** For each question it:
-
-1. **retrieves** grounding snippets from the company's security knowledge base
-   (policies, the SOC 2 report, past answers) — a *tool call*;
-2. **drafts** a grounded answer with an LLM, citing the policy ids it used;
-3. **scores its own confidence**;
-4. if confidence is low, runs **one more retrieval round with widened queries**
-   and re-drafts — a small *agentic loop*;
-5. emits an `AnswerResult` that is either ready to use or **flagged for human
-   review**.
-
-The output is a first draft for every question plus a clear "needs a human"
-list — turning days of work into minutes of review.
-
-**Why this shape stresses asyncio.** It's a fan-out/fan-in workload: many
-independent questions, each doing concurrent I/O (retrieval + LLM), all sharing
-one rate-limited provider, where some calls will be slow or fail and you must
-not let one bad question sink the batch. That is exactly the surface every
-production agentic system has to handle.
+> **Built in pure Python. No LangChain. No LangGraph. No CrewAI.**
+> The only third-party libraries are `httpx` and `pydantic`. Every piece of the agent —
+> the concurrency, retries, rate limiting, timeouts, streaming, and tool-call loop — is
+> hand-written with the standard library's `asyncio`, so you can read *exactly* how an
+> agent works under the hood instead of trusting a black box.
 
 ---
 
-## 2. Architecture & how the pieces interrelate
+## Why pure Python? (the whole point)
 
-```
- questionnaire.json
-        │  load_questions()
-        ▼
- ┌─────────────┐   bounded work_q   ┌──────────────────────────────┐
- │  producer   │ ─────────────────► │  worker pool (N coroutines)  │
- └─────────────┘   (backpressure)   │   each runs answer_question  │
-        ▲                           └──────────────┬───────────────┘
-        │ stop_event (graceful stop)               │ per question:
-        │                                          ▼
- supervised by a TaskGroup            retrieve ─► draft(stream) ─► score
-        │                                          │   └─ low? widen+redraft
-        ▼                                          ▼
-   results_q  ───────  async generator  ───►  caller (main) consumes
-                       (yields results          with `async for`,
-                        as they finish)         handles ExceptionGroup
-```
+Spinning up an agent with a framework takes an afternoon — until something leaks: it crawls
+when it should parallelize, quietly trips a rate limit, or hangs forever on a stuck call. When
+that happens, the bug lives in the async layer the framework was hiding, and framework fluency
+won't save you.
 
-The flow of control, module by module:
+This project deliberately rebuilds that layer by hand so the mechanics are visible and
+touchable:
 
-- **`main.py`** opens the pooled `LLMClient` (`async with`), then consumes
-  `run_questionnaire(...)` with `async for`, printing each result as it
-  streams in and writing `results.json` at the end.
-- **`pipeline.py`** is the orchestrator. A **producer** puts questions on a
-  **bounded `asyncio.Queue`**; a pool of **workers** drains it; each worker
-  calls the agent and pushes results to a second queue. A **`TaskGroup`**
-  supervises producer + workers. The orchestrator is an **async generator**
-  that yields results to `main` as they complete.
-- **`agent.py`** is the per-question logic: retrieve → stream-draft → score →
-  (maybe) widen-and-redraft. It converts any hard error into a flagged result
-  so the batch survives.
-- **`retriever.py`** turns the blocking knowledge-base search into safe async
-  work (`to_thread` + timeout) and fans out multi-query retrieval with
-  `gather`.
-- **`llm_client.py`** owns the pooled HTTP client and concentrates the
-  semaphore, per-attempt timeout, and retry-with-jitter logic, plus token
-  streaming.
-- **`knowledge_base.py`** is the deliberately synchronous, CPU-bound search
-  (stands in for FAISS / a local embedder).
-- **`config.py`**, **`models.py`**, **`observability.py`** are the supporting
-  cast: tunables, typed contracts, and logging/timing.
+- a **`Semaphore`** as a bulkhead bounding concurrent LLM calls (rate-limit protection)
+- **retries with exponential backoff *and jitter*** for transient failures
+- a **per-attempt `asyncio.timeout`** so a hung call can't freeze a worker
+- **`asyncio.TaskGroup`** supervising a worker pool with structured concurrency
+- a **bounded `asyncio.Queue`** for producer/consumer handoff and backpressure
+- **`asyncio.to_thread`** to keep blocking CPU work off the event loop
+- **async generators** streaming results out as they complete
+- **partial-failure isolation** — one bad question never sinks the batch
+
+It runs **completely offline with no API key** (the LLM is simulated with realistic latency and
+failures), so anyone can clone it and watch all of the above work in one command.
 
 ---
 
-## 3. Concept-by-concept: why it's here and what breaks without it
+## Quickstart
 
-> Each entry: **why we use it**, **what happens if you don't**, and **where**
-> it lives.
+**Requirements:** Python **3.11 or newer** (it uses `TaskGroup`, `except*`, and
+`asyncio.timeout`, all introduced in 3.11).
 
-### Concept 1 — Core concurrency model (event loop, coroutines, tasks)
-**Why:** the entire system is one event loop running many coroutines; the whole
-point is that while one question waits on the LLM, others make progress.
-**Without it:** if you don't understand what yields vs. blocks, you write code
-that looks async but runs serially — see Concept 8 for the classic trap.
-**Where:** everywhere; `asyncio.run(main())` in `main.py` starts the loop.
+```bash
+# 1. clone
+git clone https://github.com/<your-username>/qagent.git
+cd qagent
 
-### Concept 2 — Structured concurrency (`gather`, `TaskGroup`)
-**Why:** this is where throughput comes from. `TaskGroup` supervises the worker
-pool with structured lifetimes; `gather` fans out multi-query retrieval.
-**Without it:** with bare `create_task` and no supervision, a crashing worker
-becomes an orphaned/leaked task and its exception may vanish; processing
-questions one-by-one instead of as a pool makes the run N times slower.
-**Where:** `pipeline.supervise()` (`TaskGroup`), `retriever.multi_retrieve()`
-(`gather`).
+# 2. create and activate a virtual environment
+python -m venv .venv
+# macOS / Linux:
+source .venv/bin/activate
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
 
-### Concept 3 — Concurrency control (`Semaphore`)
-**Why:** all workers share one LLM provider with a rate limit. The semaphore
-caps concurrent in-flight calls so we saturate the limit without exceeding it.
-**Without it:** 14 questions (or 400) hit the provider at once → a wall of 429s,
-and the retry logic then amplifies the storm. This is the single most common
-naive-agent production incident.
-**Where:** `LLMClient._semaphore`, acquired in `LLMClient.stream()`.
+# 3. install the two dependencies
+python -m pip install httpx pydantic
 
-### Concept 4 — Coordination primitives (`Queue`, `Event`)
-**Why:** the bounded `Queue` is the producer/consumer handoff *and* the
-backpressure mechanism — when workers fall behind, the producer pauses instead
-of buffering everything in memory. The `Event` is the graceful-stop signal.
-**Without it:** an unbounded hand-off lets a 10k-question job balloon memory
-until the process dies; without the stop event, Ctrl-C either does nothing
-graceful or kills work mid-flight.
-**Where:** `pipeline.run_questionnaire()` (`work_q`, `results_q`, `stop_event`),
-signal wired in `main.install_signal_handler()`.
-
-### Concept 5 — Async iteration & streaming (async generators, `async for`)
-**Why:** two places. (a) The LLM client exposes token streaming as an async
-generator, so answers can surface as they're produced. (b) The pipeline itself
-is an async generator yielding finished results to the caller as they complete
-— the UI/caller sees progress immediately instead of waiting for all 400.
-**Without it:** you buffer the entire batch and hand it back at the end; a long
-questionnaire shows a frozen screen for minutes, and you can't stream a single
-answer's tokens to a reviewer.
-**Where:** `LLMClient.stream()`, `agent._draft()` (`async for chunk`),
-`pipeline.run_questionnaire()` (yields results), `main` (`async for result`).
-
-### Concept 6 — Timeouts & cancellation (`asyncio.timeout`, `CancelledError`)
-**Why:** external tools and LLM calls hang. Every call gets a deadline so one
-stuck request can't freeze a worker forever; cancellation must be handled so a
-cut-off task cleans up.
-**Without it:** a single hung LLM call ties up a worker (and its semaphore slot)
-indefinitely; throughput silently collapses as workers get stuck. Swallowing
-`CancelledError` would break shutdown and leak zombie tasks.
-**Where:** `asyncio.timeout` in `LLMClient.stream()` and `retriever.retrieve()`;
-`answer_question()` re-raises `CancelledError` and absorbs everything else.
-*Run Q13 to watch a `TimeoutError` fire on the first attempt and recover on
-retry.*
-
-### Concept 7 — Error handling at scale (`ExceptionGroup`/`except*`, partial failure, retries+jitter)
-**Why:** at fan-out scale, multiple things fail at once. Transient 429/503s get
-retried with **jitter** (so concurrent retries don't sync up and re-hammer the
-provider); per-question hard failures are isolated into flagged results; genuine
-pipeline-level bugs surface as an `ExceptionGroup` handled with `except*`.
-**Without it:** no retries → every transient blip becomes a failed answer; no
-jitter → retry storms; no per-question isolation → one exception kills the whole
-batch and you lose 399 good answers because of 1 bad question.
-**Where:** retry loop + `_backoff` jitter in `LLMClient`; `gather(return_
-exceptions=True)` in `multi_retrieve`; `try/except Exception` → flagged result
-in `answer_question`; `except* Exception` in `main`. *Run Q14 to see retries
-exhaust into an isolated, flagged hard error while every other question
-succeeds.*
-
-### Concept 8 — Mixing sync and async (`to_thread`)
-**Why:** the vector search is synchronous, CPU-bound work. Offloading it to a
-thread keeps the event loop free to service every other coroutine.
-**Without it:** calling `search_sync()` directly in the loop blocks *every*
-worker for the duration of each search — the whole system serializes behind one
-CPU-bound call and your carefully-built concurrency evaporates. This is *the*
-trap from Concept 1 made concrete.
-**Where:** `retriever.retrieve()` → `await asyncio.to_thread(search_sync, ...)`.
-(For true CPU-bound work like local inference you'd use a process pool; the
-knowledge base notes this.)
-
-### Concept 9 — Resource & lifecycle (async context managers, pooled client, shutdown)
-**Why:** one pooled `httpx.AsyncClient` is reused across every call; its
-lifetime is bounded by `async with`. Cleanup lives in `finally`/context managers
-so it survives cancellation.
-**Without it:** a new client per call leaks connections and throttles throughput;
-resources created without context-manager cleanup leak when a task is cancelled
-mid-flight.
-**Where:** `LLMClient.__aenter__/__aexit__`, used as `async with LLMClient(...)`
-in `main`; the pipeline's `finally` block tears down the supervisor cleanly.
-
-### Concept 10 — Observability & debugging
-**Why:** concurrent bugs are non-deterministic, so timing and failures are
-visible by default. `guard_task` ensures a detached task's exception is logged
-rather than silently swallowed; `timed` catches accidental serialization;
-debug mode surfaces un-awaited coroutines.
-**Without it:** a fire-and-forget task fails silently and you never know; an
-accidentally-serial section looks fine until you measure it.
-**Where:** `observability.py` (`setup_logging`, `timed`, `guard_task`); used on
-the supervisor task in `pipeline.py` and via `--debug`-style `asyncio_debug` in
-`config.py`.
-
----
-
-## 4. Running it & what you'll see
-
-```
+# 4. run it  (note: run as a MODULE, not the file directly — see below)
 python -m qagent.main
 ```
 
-In the logs you'll observe, all interleaved (proof of concurrency):
+That's it — no API key, no network. You'll see logs stream by and a `results.json` appear.
+
+> ⚠️ **Run it as `python -m qagent.main`, from the project root.**
+> Do **not** run `qagent/main.py` directly (or hit "Run" in your editor). The project is a
+> package that uses relative imports (`from .config import ...`), so it must be launched as a
+> module. Running the file on its own gives
+> `ImportError: attempted relative import with no known parent package`.
+
+---
+
+## What you'll see
+
+The pipeline answers 14 sample security questions concurrently. In the interleaved logs you'll
+watch the resilience machinery actually fire:
 
 - several questions **retrying** transient failures with jittered backoff,
-- **Q13** hitting a **timeout** on attempt 0 and recovering on retry (~2.1s),
-- a couple of **low-confidence retries** widening their search,
-- **Q14** exhausting retries into an **isolated hard error** flagged
-  `[REVIEW]`, while every other question still completes,
-- a final summary and `results.json`.
+- one question hitting a **timeout** and recovering on retry,
+- a low-confidence answer triggering a **second, widened retrieval round** (the agentic loop),
+- one question **failing permanently** and being **isolated and flagged for human review** —
+  while every other question still completes,
+- a final summary written to `results.json`.
 
-## 5. Going to production (what's simulated here)
+```
+OK  Q01 | medium |   177ms | Do you encrypt customer data at rest?
+retry | Q13 attempt=1 after 0.08s (TimeoutError)
+OK  Q13 | medium |  2174ms | What is your stance on post-quantum cryptography readiness?
+ERR Q14 | low    |   264ms | [REVIEW] Describe your runtime memory isolation between tenants.
+...
+Processed 14 questions
+  high=1  medium=12  low=1
+  needs human review: 1
+  hard errors:        1
+```
 
-- **`use_fake_llm=True`** returns deterministic simulated responses with
-  realistic latency/failures so the project runs with no API key. Set it to
-  `False` and complete `LLMClient._real_stream()` (the request shape is already
-  there) to talk to a real provider.
-- The **knowledge base** is a bag-of-words cosine search over ~13 snippets,
-  standing in for FAISS + a real embedding model. Confidence is driven by
-  retrieval relevance, so a true knowledge *gap* should surface as low
-  confidence; the toy scorer is approximate, but the retrieve→score→escalate
-  mechanics are the real thing.
-- Real deployments would add: persistent run state, a human-review UI consuming
-  the streamed results, structured tracing (OpenTelemetry), and a process pool
-  if you run embeddings locally.
+---
 
-## 6. Layout
+## How it works
+
+Each question flows through a small agent loop — **retrieve → draft → score → escalate if
+unsure** — and many questions run concurrently through a supervised worker pool:
+
+```
+ questionnaire.json
+        │
+        ▼
+   producer ──▶ [ bounded work queue ] ──▶ worker pool (×N)
+        ▲            (backpressure)             │  each worker runs one question:
+        │                                       │    retrieve ─▶ draft ─▶ score
+   stop_event                                   │       └─ low confidence? widen + redraft
+   (graceful stop)                              ▼
+        supervised by a TaskGroup ──▶ [ results queue ] ──▶ streamed to the caller
+```
+
+The whole system is deliberately split so the boundaries are clear: the two files that touch
+the outside world (`llm_client.py` for the model, `knowledge_base.py` for search) are isolated
+at the edges, and everything between them is pure, testable logic.
+
+### Project layout
 
 ```
 qagent/
   config.py           tunables: concurrency, timeouts, retries, queue size
-  models.py           Pydantic contracts: Question, RetrievedDoc, AnswerResult
-  observability.py    logging, timing context manager, task guard
-  knowledge_base.py   SYNC, CPU-bound vector search (to be offloaded)
+  models.py           typed contracts: Question, RetrievedDoc, AnswerResult
+  observability.py    logging, timing, task-failure guard
+  knowledge_base.py   synchronous, CPU-bound vector search (stands in for FAISS)
   llm_client.py       pooled client + semaphore + timeout + retries + streaming
-  retriever.py        to_thread offload + gather multi-query
-  agent.py            per-question: retrieve -> draft -> score -> escalate
-  pipeline.py         Queue + worker pool + TaskGroup + async-generator output
-  main.py             lifecycle, consume stream, except*, graceful shutdown
-  data/questionnaire.json
+  retriever.py        to_thread offload + gather multi-query retrieval
+  agent.py            per-question loop: retrieve → draft → score → escalate
+  pipeline.py         queue + worker pool + TaskGroup + async-generator output
+  main.py             entrypoint: lifecycle, streaming, graceful shutdown
+  data/
+    questionnaire.json   the sample questions
 ```
+
+---
+
+## The production armor (what each guard prevents)
+
+Almost every line outside the core logic exists to survive calling a flaky external service at
+scale. A sample of the guards and the real-world hazard each one stops:
+
+| Guard | File | Without it |
+|---|---|---|
+| `Semaphore` concurrency cap | `llm_client.py` | 400 calls fire at once → a wall of `429` rate-limit errors |
+| Retries + **jitter** | `llm_client.py` | every transient blip becomes a failed question; synced retries re-create the spike |
+| Per-attempt `asyncio.timeout` | `llm_client.py` | one hung call freezes a worker (and its semaphore slot) forever |
+| Pooled client lifecycle | `llm_client.py` | a new connection per call leaks sockets until the process dies |
+| `to_thread` offload | `retriever.py` | the blocking search freezes **every** worker; concurrency collapses to serial |
+| `except Exception` → flagged result | `agent.py` | one bad question crashes the whole batch |
+| `except asyncio.CancelledError: raise` | `agent.py` | cancellation is swallowed → zombie tasks, Ctrl-C stops working |
+| `TaskGroup` supervision | `pipeline.py` | a crashing worker leaks as an orphaned task and its error vanishes |
+| Bounded queue (backpressure) | `pipeline.py` | a large job loads everything into memory until it dies |
+| `guard_task` + millisecond logs | `observability.py` | silent background failures; no way to reconstruct a concurrent run |
+
+---
+
+## Using a real LLM
+
+By default the client runs in simulation mode so the project works offline. To point it at a
+real provider:
+
+1. In `qagent/config.py`, set `use_fake_llm = False`.
+2. In `qagent/llm_client.py`, complete `_real_stream()` — the request shape (a streaming
+   `POST` to the messages endpoint) is already there; add your provider's auth header and
+   parse its streamed response format.
+
+Nothing else changes. The semaphore, retries, timeouts, and streaming that guarded the
+simulator now guard the real provider — because the rest of the system only ever sees the
+`stream` / `complete` interface, not the call underneath.
+
+---
+
+## Optional: see the control flow live
+
+`trace_run.py` (if included) instruments the real functions and runs the pipeline, printing a
+per-question trace of control passing from file to file and writing an interactive HTML
+timeline. Run it the same way:
+
+```bash
+python trace_run.py
+```
+
+---
+
+## Troubleshooting
+
+- **`ModuleNotFoundError: No module named 'httpx'`** — the virtual environment isn't active or
+  the deps aren't installed *in it*. Activate `.venv`, then run
+  `python -m pip install httpx pydantic` (using `python -m pip` guarantees they install into
+  the same interpreter you run with).
+- **`ImportError: attempted relative import with no known parent package`** — you ran the file
+  directly. Use `python -m qagent.main` from the project root instead.
+- **`FileNotFoundError: ...questionnaire.json`** — the `qagent/data/questionnaire.json` file is
+  missing. Make sure it exists (on Windows, confirm it isn't saved as `questionnaire.json.txt`).
+- **`SyntaxError` around `except*` or `TaskGroup`** — you're on Python < 3.11. Upgrade to 3.11+.
+
+---
+
+## License
+
+MIT — see `LICENSE`. Free to use, learn from, and build on.
