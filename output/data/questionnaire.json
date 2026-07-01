@@ -1,0 +1,16 @@
+[
+  {"id": "Q01", "text": "Do you encrypt customer data at rest?", "category": "encryption"},
+  {"id": "Q02", "text": "Is data encrypted in transit, and what TLS version do you require?", "category": "encryption"},
+  {"id": "Q03", "text": "Do you hold a SOC 2 report and can you share it?", "category": "compliance"},
+  {"id": "Q04", "text": "What is your data retention and deletion policy after contract termination?", "category": "data-governance"},
+  {"id": "Q05", "text": "Do you enforce multi-factor authentication for production access?", "category": "access-control"},
+  {"id": "Q06", "text": "What is your breach notification timeline?", "category": "incident-response"},
+  {"id": "Q07", "text": "What are your RTO and RPO for disaster recovery?", "category": "resilience"},
+  {"id": "Q08", "text": "How often do you perform penetration testing and vulnerability scans?", "category": "security-testing"},
+  {"id": "Q09", "text": "Do employees receive security awareness training?", "category": "people"},
+  {"id": "Q10", "text": "Where is production data hosted and which cloud provider do you use?", "category": "infrastructure"},
+  {"id": "Q11", "text": "Do you maintain and publish a list of subprocessors?", "category": "third-party"},
+  {"id": "Q12", "text": "Do you support FIDO2 hardware security keys for customer single sign-on?", "category": "access-control"},
+  {"id": "Q13", "text": "What is your stance on post-quantum cryptography readiness?", "category": "encryption"},
+  {"id": "Q14", "text": "Describe your runtime memory isolation between tenants.", "category": "architecture"}
+]
